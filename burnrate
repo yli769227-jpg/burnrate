@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""burnrate — 你今天用 Claude Code 烧了多少钱?
+
+Real-time cost tracker for Claude Code. Single-file Python, zero deps, never phones home.
+
+Usage:
+    burnrate              # today's burn
+    burnrate week         # last 7 days bar chart
+    burnrate live         # tail current session, realtime
+    burnrate -h / --help
+
+Reads ~/.claude/projects/**/*.jsonl, applies pricing.json, prints to stdout.
+Nothing leaves your machine.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable, Iterator
+
+__version__ = "0.1.0"
+
+PROJECTS_DIR = Path(os.environ.get("BURNRATE_PROJECTS_DIR",
+                                   str(Path.home() / ".claude" / "projects")))
+HERE = Path(__file__).resolve().parent
+
+# ---------- 颜色 ----------
+def _color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"): return False
+    return sys.stdout.isatty()
+
+if _color_enabled():
+    C_RED, C_GRN, C_YEL, C_BLU, C_MAG, C_CYN, C_DIM, C_BLD, C_RST = (
+        "\033[31m", "\033[32m", "\033[33m", "\033[34m",
+        "\033[35m", "\033[36m", "\033[2m",  "\033[1m", "\033[0m")
+else:
+    C_RED = C_GRN = C_YEL = C_BLU = C_MAG = C_CYN = C_DIM = C_BLD = C_RST = ""
+
+FIRE = "🔥"
+
+# ---------- pricing ----------
+def load_pricing() -> dict:
+    """Locate pricing.json (next to script, then ~/.config, then embedded fallback)."""
+    candidates = [
+        HERE / "pricing.json",
+        Path.home() / ".config" / "burnrate" / "pricing.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                return json.loads(p.read_text())
+            except json.JSONDecodeError as e:
+                print(f"{C_YEL}[!]{C_RST} pricing.json 损坏: {p}: {e}", file=sys.stderr)
+    # Embedded fallback (just Sonnet defaults — install.sh should always ship pricing.json)
+    return {
+        "models": {},
+        "fallback": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.30},
+    }
+
+
+import re as _re
+_DATE_SUFFIX = _re.compile(r"-\d{8}$")  # e.g. -20260416
+
+def normalize_model(m: str | None) -> str | None:
+    """`claude-opus-4-7[1m]` / `claude-haiku-4-5-20251001` → `claude-opus-4-7` / `claude-haiku-4-5`."""
+    if not m:
+        return None
+    m = m.split("[")[0].strip()
+    m = _DATE_SUFFIX.sub("", m)
+    return m
+
+
+def price_for(model: str | None, pricing: dict) -> dict:
+    if not model:
+        return pricing.get("fallback", {})
+    models = pricing.get("models", {})
+    if model in models:
+        return models[model]
+    # prefix fallback (e.g. claude-opus-4-7-20260416 → claude-opus-4-7)
+    for k in sorted(models.keys(), key=len, reverse=True):
+        if model.startswith(k):
+            return models[k]
+    return pricing.get("fallback", {})
+
+
+def cost_of(usage: dict, price: dict) -> float:
+    return (
+        usage.get("input_tokens", 0) * price.get("input", 0)
+        + usage.get("output_tokens", 0) * price.get("output", 0)
+        + usage.get("cache_creation_input_tokens", 0) * price.get("cache_write", 0)
+        + usage.get("cache_read_input_tokens", 0) * price.get("cache_read", 0)
+    ) / 1_000_000
+
+
+# ---------- 转录解析 ----------
+def iter_events(projects_dir: Path, since: datetime | None = None,
+                until: datetime | None = None,
+                file_filter: Path | None = None) -> Iterator[dict]:
+    """Walk *.jsonl. Yield {timestamp, model, usage, session, cwd, file}."""
+    files: Iterable[Path]
+    if file_filter:
+        files = [file_filter]
+    else:
+        files = sorted(projects_dir.glob("**/*.jsonl"))
+
+    for jl in files:
+        # cheap pre-filter: skip files modified before `since`
+        if since is not None:
+            try:
+                mtime = datetime.fromtimestamp(jl.stat().st_mtime, tz=timezone.utc)
+                if mtime < since - timedelta(days=1):
+                    continue
+            except OSError:
+                continue
+        try:
+            with jl.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    yield from _parse_line(line, jl, since, until)
+        except OSError:
+            continue
+
+
+def _parse_line(line: str, file: Path, since, until):
+    # Fast-path: most lines lack usage; skip without parsing
+    if '"input_tokens"' not in line:
+        return
+    try:
+        d = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    msg = d.get("message") or {}
+    if msg.get("role") != "assistant":
+        return
+    usage = msg.get("usage")
+    if not usage:
+        return
+    ts = d.get("timestamp")
+    if not ts:
+        return
+    try:
+        t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return
+    if since and t < since:
+        return
+    if until and t > until:
+        return
+    yield {
+        "timestamp": t,
+        "model": normalize_model(msg.get("model")),
+        "usage": usage,
+        "session": d.get("sessionId"),
+        "cwd": d.get("cwd"),
+        "file": str(file),
+    }
+
+
+# ---------- 输出辅助 ----------
+def fmt_money(x: float) -> str:
+    if x >= 100: return f"${x:,.0f}"
+    if x >= 10:  return f"${x:,.2f}"
+    return f"${x:.3f}"
+
+
+def bar(value: float, max_value: float, width: int = 22) -> str:
+    if max_value <= 0:
+        return " " * width
+    fill = int(round(value / max_value * width))
+    return ("█" * fill).ljust(width, "░")
+
+
+def trim_cwd(cwd: str | None, max_len: int = 40) -> str:
+    if not cwd: return "(unknown)"
+    home = str(Path.home())
+    if cwd.startswith(home):
+        cwd = "~" + cwd[len(home):]
+    if len(cwd) > max_len:
+        cwd = "…" + cwd[-(max_len - 1):]
+    return cwd
+
+
+def pct(part: float, whole: float) -> str:
+    if whole <= 0: return "  0%"
+    return f"{part / whole * 100:>3.0f}%"
+
+
+# ---------- 子命令: today ----------
+def cmd_today(args, pricing):
+    now = datetime.now().astimezone()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    week_start = today_start - timedelta(days=7)
+
+    events_today = []
+    events_yesterday = []
+    events_week = []
+    for ev in iter_events(PROJECTS_DIR, since=week_start.astimezone(timezone.utc)):
+        t_local = ev["timestamp"].astimezone()
+        if t_local >= today_start:
+            events_today.append(ev)
+        elif t_local >= yesterday_start:
+            events_yesterday.append(ev)
+        events_week.append(ev)
+
+    today_cost = sum(cost_of(e["usage"], price_for(e["model"], pricing)) for e in events_today)
+    y_cost = sum(cost_of(e["usage"], price_for(e["model"], pricing)) for e in events_yesterday)
+    week_cost = sum(cost_of(e["usage"], price_for(e["model"], pricing)) for e in events_week)
+    avg_7d = week_cost / 7 if events_week else 0
+
+    by_model = defaultdict(float)
+    by_cwd = defaultdict(float)
+    most_expensive = None
+    for e in events_today:
+        c = cost_of(e["usage"], price_for(e["model"], pricing))
+        by_model[e["model"] or "(unknown)"] += c
+        by_cwd[e["cwd"]] += c
+        if most_expensive is None or c > most_expensive[1]:
+            most_expensive = (e, c)
+
+    # 缓存命中
+    total_input_eq = sum(
+        e["usage"].get("input_tokens", 0)
+        + e["usage"].get("cache_creation_input_tokens", 0)
+        + e["usage"].get("cache_read_input_tokens", 0)
+        for e in events_today
+    )
+    cache_read = sum(e["usage"].get("cache_read_input_tokens", 0) for e in events_today)
+    cache_hit = (cache_read / total_input_eq * 100) if total_input_eq else 0
+
+    # 输出
+    print()
+    print(f"  {FIRE} {C_BLD}burnrate{C_RST}  {now.strftime('%Y-%m-%d %a · %H:%M')}")
+    print()
+    print(f"    {C_DIM}今日{C_RST}            {C_BLD}{fmt_money(today_cost)}{C_RST}")
+    if y_cost > 0:
+        delta = (today_cost - y_cost) / y_cost * 100
+        arrow = f"{C_RED}↑{C_RST}" if delta > 0 else f"{C_GRN}↓{C_RST}"
+        print(f"    {C_DIM}vs 昨日{C_RST}         {arrow} {abs(delta):.0f}%   (昨日 {fmt_money(y_cost)})")
+    if avg_7d > 0:
+        delta = (today_cost - avg_7d) / avg_7d * 100
+        arrow = f"{C_RED}↑{C_RST}" if delta > 0 else f"{C_GRN}↓{C_RST}"
+        print(f"    {C_DIM}vs 7日均{C_RST}        {arrow} {abs(delta):.0f}%   (7日均 {fmt_money(avg_7d)}/天)")
+    print()
+
+    if by_model:
+        print(f"  {C_DIM}按模型{C_RST}")
+        max_m = max(by_model.values()) if by_model else 1
+        for model, c in sorted(by_model.items(), key=lambda x: -x[1])[:5]:
+            if c < 0.001: continue  # skip synthetic / zero-cost placeholders
+            short = model.replace("claude-", "").replace("anthropic.", "") if model else "?"
+            print(f"    {short:<18} {fmt_money(c):>8}  {pct(c, today_cost)}  {C_CYN}{bar(c, max_m, 16)}{C_RST}")
+        print()
+
+    if by_cwd:
+        print(f"  {C_DIM}按项目{C_RST}")
+        for cwd, c in sorted(by_cwd.items(), key=lambda x: -x[1])[:5]:
+            print(f"    {trim_cwd(cwd, 42):<42} {fmt_money(c):>8}  {pct(c, today_cost)}")
+        print()
+
+    if total_input_eq > 0:
+        saved = sum(
+            e["usage"].get("cache_read_input_tokens", 0) *
+            (price_for(e["model"], pricing).get("input", 0) -
+             price_for(e["model"], pricing).get("cache_read", 0))
+            for e in events_today
+        ) / 1_000_000
+        print(f"  {C_DIM}缓存命中{C_RST}       {C_GRN}{cache_hit:>4.0f}%{C_RST}    {C_DIM}(省下约 {fmt_money(saved)}){C_RST}")
+
+    if most_expensive:
+        ev, c = most_expensive
+        t = ev["timestamp"].astimezone().strftime("%H:%M")
+        print(f"  {C_DIM}最贵一轮{C_RST}       {C_YEL}{t}{C_RST}     {fmt_money(c)}   {trim_cwd(ev['cwd'], 30)}")
+
+    if not events_today:
+        print(f"  {C_DIM}今天还没烧 token,继续干活{C_RST}")
+    print()
+
+
+# ---------- 子命令: week ----------
+def cmd_week(args, pricing):
+    now = datetime.now().astimezone()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_start - timedelta(days=6)  # include today = 7 days
+
+    daily = defaultdict(float)
+    by_model = defaultdict(float)
+    total_cache_read = 0
+    total_input_eq = 0
+    total_saved = 0.0
+    n_events = 0
+
+    for ev in iter_events(PROJECTS_DIR, since=week_start.astimezone(timezone.utc)):
+        t_local = ev["timestamp"].astimezone()
+        day = t_local.date()
+        p = price_for(ev["model"], pricing)
+        c = cost_of(ev["usage"], p)
+        daily[day] += c
+        by_model[ev["model"] or "(unknown)"] += c
+        u = ev["usage"]
+        total_cache_read += u.get("cache_read_input_tokens", 0)
+        total_input_eq += (u.get("input_tokens", 0) +
+                           u.get("cache_creation_input_tokens", 0) +
+                           u.get("cache_read_input_tokens", 0))
+        total_saved += u.get("cache_read_input_tokens", 0) * (
+            p.get("input", 0) - p.get("cache_read", 0)) / 1_000_000
+        n_events += 1
+
+    total = sum(daily.values())
+    max_day = max(daily.values()) if daily else 1.0
+
+    print()
+    print(f"  {FIRE} {C_BLD}burnrate · 过去 7 天{C_RST}  共 {C_BLD}{fmt_money(total)}{C_RST}")
+    print()
+    for i in range(7):
+        d = (week_start + timedelta(days=i)).date()
+        c = daily.get(d, 0)
+        wd = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][d.weekday()]
+        is_today = d == now.date()
+        marker = f" {C_YEL}← today{C_RST}" if is_today else ""
+        print(f"    {wd} {d.strftime('%m-%d')}  {C_CYN}{bar(c, max_day, 24)}{C_RST}  {fmt_money(c):>8}{marker}")
+    print()
+
+    if by_model:
+        print(f"  {C_DIM}按模型{C_RST}")
+        for model, c in sorted(by_model.items(), key=lambda x: -x[1])[:5]:
+            if c < 0.001: continue  # skip synthetic / zero-cost placeholders
+            short = model.replace("claude-", "") if model else "?"
+            print(f"    {short:<18} {fmt_money(c):>8}  {pct(c, total)}")
+        print()
+
+    if total_input_eq > 0:
+        cache_hit = total_cache_read / total_input_eq * 100
+        print(f"  {C_DIM}缓存命中率{C_RST}     {C_GRN}{cache_hit:>4.0f}%{C_RST}    {C_DIM}省下约 {fmt_money(total_saved)}{C_RST}")
+    print(f"  {C_DIM}总事件数{C_RST}        {n_events}")
+    if total > 0:
+        avg = total / 7
+        print(f"  {C_DIM}日均{C_RST}            {fmt_money(avg)} / 天   {C_DIM}(月度估算 {fmt_money(avg * 30)}){C_RST}")
+    print()
+
+
+# ---------- 子命令: live ----------
+def find_latest_session_file() -> Path | None:
+    """Most recently modified jsonl (touched in last 5 min wins; else latest)."""
+    now = time.time()
+    recent = []
+    for jl in PROJECTS_DIR.glob("**/*.jsonl"):
+        try:
+            mtime = jl.stat().st_mtime
+        except OSError:
+            continue
+        if now - mtime < 300:
+            recent.append((mtime, jl))
+    if recent:
+        return max(recent, key=lambda x: x[0])[1]
+    # fallback: latest overall
+    all_files = [(jl.stat().st_mtime, jl) for jl in PROJECTS_DIR.glob("**/*.jsonl") if jl.exists()]
+    if not all_files:
+        return None
+    return max(all_files, key=lambda x: x[0])[1]
+
+
+def cmd_live(args, pricing):
+    target = Path(args.file) if args.file else find_latest_session_file()
+    if not target or not target.exists():
+        print(f"{C_RED}[x]{C_RST} 找不到 session 转录文件。先在 Claude Code 里跟 AI 说一句话再回来。",
+              file=sys.stderr)
+        return 1
+
+    print(f"  {FIRE} {C_BLD}burnrate · LIVE{C_RST}")
+    print(f"  {C_DIM}watching{C_RST} {target}")
+    print(f"  {C_DIM}Ctrl+C to exit{C_RST}")
+    print()
+
+    session_cost = 0.0
+    last_turn_cost = 0.0
+    last_model = None
+    last_cache_hit = 0
+    n_turns = 0
+    session_start_wall = time.time()
+
+    # bootstrap: process current contents once
+    pos = 0
+    try:
+        with target.open("r", encoding="utf-8", errors="ignore") as f:
+            while True:
+                line = f.readline()
+                if not line:
+                    pos = f.tell()
+                    break
+                for ev in _parse_line(line, target, None, None):
+                    p = price_for(ev["model"], pricing)
+                    c = cost_of(ev["usage"], p)
+                    session_cost += c
+                    last_turn_cost = c
+                    last_model = ev["model"]
+                    u = ev["usage"]
+                    total_in = (u.get("input_tokens", 0) +
+                                u.get("cache_creation_input_tokens", 0) +
+                                u.get("cache_read_input_tokens", 0))
+                    if total_in:
+                        last_cache_hit = u.get("cache_read_input_tokens", 0) / total_in * 100
+                    n_turns += 1
+    except OSError as e:
+        print(f"{C_RED}[x]{C_RST} 读 transcript 失败: {e}", file=sys.stderr)
+        return 1
+
+    _render_live(session_cost, last_turn_cost, last_model, last_cache_hit, n_turns,
+                 session_start_wall, target)
+
+    # tail loop
+    try:
+        with target.open("r", encoding="utf-8", errors="ignore") as f:
+            f.seek(pos)
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.5)
+                    continue
+                for ev in _parse_line(line, target, None, None):
+                    p = price_for(ev["model"], pricing)
+                    c = cost_of(ev["usage"], p)
+                    session_cost += c
+                    last_turn_cost = c
+                    last_model = ev["model"]
+                    u = ev["usage"]
+                    total_in = (u.get("input_tokens", 0) +
+                                u.get("cache_creation_input_tokens", 0) +
+                                u.get("cache_read_input_tokens", 0))
+                    if total_in:
+                        last_cache_hit = u.get("cache_read_input_tokens", 0) / total_in * 100
+                    n_turns += 1
+                    _render_live(session_cost, last_turn_cost, last_model,
+                                 last_cache_hit, n_turns, session_start_wall, target)
+    except KeyboardInterrupt:
+        print()
+        print(f"  {C_DIM}总计 {fmt_money(session_cost)} · {n_turns} 轮 · 平均 "
+              f"{fmt_money(session_cost / max(n_turns, 1))}/轮{C_RST}")
+        return 0
+
+
+def _render_live(session_cost, last_turn_cost, last_model, last_cache_hit,
+                 n_turns, session_start_wall, target):
+    # in-place update via carriage return + clear line
+    avg_per_turn = session_cost / max(n_turns, 1)
+    model_short = (last_model or "?").replace("claude-", "")
+    line = (
+        f"  {FIRE} session {C_BLD}{fmt_money(session_cost)}{C_RST}"
+        f"  ·  上一轮 {fmt_money(last_turn_cost)} ({model_short}, cache {last_cache_hit:.0f}%)"
+        f"  ·  {n_turns} 轮  ·  avg {fmt_money(avg_per_turn)}/轮"
+    )
+    sys.stdout.write("\r\033[K" + line)
+    sys.stdout.flush()
+
+
+# ---------- main ----------
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="burnrate",
+        description="🔥 你今天用 Claude Code 烧了多少钱? Real-time cost tracker.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="子命令: burnrate (today) / burnrate week / burnrate live\n"
+               "更多: github.com/yli769227-jpg/burnrate",
+    )
+    parser.add_argument("--version", action="version", version=f"burnrate {__version__}")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_today = sub.add_parser("today", help="今日烧钱速率(默认)")
+    p_today.set_defaults(func=cmd_today)
+
+    p_week = sub.add_parser("week", help="过去 7 天柱状图")
+    p_week.set_defaults(func=cmd_week)
+
+    p_live = sub.add_parser("live", help="实时盯当前 session")
+    p_live.add_argument("--file", "-f", help="指定 jsonl 转录文件(默认自动找最新)")
+    p_live.set_defaults(func=cmd_live)
+
+    args = parser.parse_args(argv)
+    pricing = load_pricing()
+
+    if not PROJECTS_DIR.exists():
+        print(f"{C_RED}[x]{C_RST} 没找到 Claude Code 转录目录: {PROJECTS_DIR}", file=sys.stderr)
+        print(f"    设 BURNRATE_PROJECTS_DIR 环境变量指向你的转录路径", file=sys.stderr)
+        return 1
+
+    func = getattr(args, "func", cmd_today)
+    return func(args, pricing) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
