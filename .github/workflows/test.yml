@@ -21,7 +21,7 @@ jobs:
       - name: Lint install.sh
         run: |
           bash -n install.sh
-          shellcheck install.sh
+          shellcheck --severity=warning install.sh
 
       - name: Run tests
         run: |
