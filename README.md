@@ -6,6 +6,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/yli769227-jpg/burnrate/actions/workflows/test.yml"><img src="https://github.com/yli769227-jpg/burnrate/actions/workflows/test.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT"></a>
   <img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+">
   <a href="#install"><img src="https://img.shields.io/badge/install-curl_%7C_bash-green.svg" alt="curl | bash"></a>
@@ -151,6 +152,14 @@ A: V1 只读 Claude Code transcripts。Codex / Cursor 有类似 jsonl 但 schema
 
 **Q: 那我跑 `burnrate` 显示的是 Anthropic 的实际账单吗?**
 A: 不完全是 —— 我们读的是本地 transcript 的 `usage` 字段,Anthropic 后台可能有微小校准。差异通常 <1%。
+
+**Q: `burnrate` 的 "7日均" 和 `burnrate week` 的窗口一样吗?**
+A: 不一样,刻意如此:
+- `burnrate`(today)的 **"7日均"** = **过去 7 个完整自然日**(不含今天)的日均,语义是"今天 vs 过去 7 个完整日均值"——今天还没过完,混进去会把均值拉偏。
+- `burnrate week` = **今天 + 过去 6 个完整自然日**,共 7 个自然日(柱状图最后一根就是今天,标 `← today`),它的"日均"也按这 7 天算。
+
+**Q: 我用过 `--resume` / 会话分支,会重复计费吗?**
+A: 不会。Claude Code resume 时会把历史消息复制进新 session 文件,burnrate 按 `message.id + requestId` 去重,同一次 API 调用只计一次。
 
 **Q: cache hit rate 怎么定义?**
 A: `cache_read_input_tokens / (input_tokens + cache_creation_input_tokens + cache_read_input_tokens)`。简单说: **总输入里有多少是命中缓存的**。

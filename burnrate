@@ -58,6 +58,8 @@ def load_pricing() -> dict:
             except json.JSONDecodeError as e:
                 print(f"{C_YEL}[!]{C_RST} pricing.json 损坏: {p}: {e}", file=sys.stderr)
     # Embedded fallback (just Sonnet defaults — install.sh should always ship pricing.json)
+    print(f"{C_YEL}[!]{C_RST} 未找到 pricing.json,所有模型按 Sonnet 默认价估算,数字可能不准",
+          file=sys.stderr)
     return {
         "models": {},
         "fallback": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.30},
@@ -76,16 +78,19 @@ def normalize_model(m: str | None) -> str | None:
     return m
 
 
+_warned_models: set[str] = set()
+
 def price_for(model: str | None, pricing: dict) -> dict:
     if not model:
         return pricing.get("fallback", {})
     models = pricing.get("models", {})
     if model in models:
         return models[model]
-    # prefix fallback (e.g. claude-opus-4-7-20260416 → claude-opus-4-7)
-    for k in sorted(models.keys(), key=len, reverse=True):
-        if model.startswith(k):
-            return models[k]
+    # normalize_model 已剥掉日期后缀,这里不做前缀猜价:
+    # 未知新模型(如 claude-opus-4-8)前缀命中旧款会静默按错误价格计,宁可走 fallback 并警告。
+    if model not in _warned_models:
+        _warned_models.add(model)
+        print(f"{C_YEL}[!]{C_RST} 未知模型 {model},按 fallback 价估算", file=sys.stderr)
     return pricing.get("fallback", {})
 
 
@@ -109,6 +114,9 @@ def iter_events(projects_dir: Path, since: datetime | None = None,
     else:
         files = sorted(projects_dir.glob("**/*.jsonl"))
 
+    # Claude Code --resume / 会话分支会把历史消息(含 usage)复制进新 session jsonl,
+    # 同一次 API 调用按 message.id + requestId 去重,避免重复计费。
+    seen: set[str] = set()
     for jl in files:
         # cheap pre-filter: skip files modified before `since`
         if since is not None:
@@ -121,7 +129,15 @@ def iter_events(projects_dir: Path, since: datetime | None = None,
         try:
             with jl.open("r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    yield from _parse_line(line, jl, since, until)
+                    for ev in _parse_line(line, jl, since, until):
+                        mid, rid = ev["message_id"], ev["request_id"]
+                        if mid and rid:
+                            key = f"{mid}:{rid}"
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                        # 缺 id 的行无法判重,照常计
+                        yield ev
         except OSError:
             continue
 
@@ -158,6 +174,8 @@ def _parse_line(line: str, file: Path, since, until):
         "session": d.get("sessionId"),
         "cwd": d.get("cwd"),
         "file": str(file),
+        "message_id": msg.get("id"),
+        "request_id": d.get("requestId"),
     }
 
 
@@ -199,19 +217,21 @@ def cmd_today(args, pricing):
 
     events_today = []
     events_yesterday = []
-    events_week = []
+    events_past7 = []  # 过去 7 个完整自然日,不含今天
     for ev in iter_events(PROJECTS_DIR, since=week_start.astimezone(timezone.utc)):
         t_local = ev["timestamp"].astimezone()
         if t_local >= today_start:
             events_today.append(ev)
-        elif t_local >= yesterday_start:
-            events_yesterday.append(ev)
-        events_week.append(ev)
+        else:
+            if t_local >= yesterday_start:
+                events_yesterday.append(ev)
+            events_past7.append(ev)
 
     today_cost = sum(cost_of(e["usage"], price_for(e["model"], pricing)) for e in events_today)
     y_cost = sum(cost_of(e["usage"], price_for(e["model"], pricing)) for e in events_yesterday)
-    week_cost = sum(cost_of(e["usage"], price_for(e["model"], pricing)) for e in events_week)
-    avg_7d = week_cost / 7 if events_week else 0
+    past7_cost = sum(cost_of(e["usage"], price_for(e["model"], pricing)) for e in events_past7)
+    # "7日均" = 过去 7 个完整自然日的日均(不含今天),语义是 "今天 vs 过去 7 个完整日均值"
+    avg_7d = past7_cost / 7 if events_past7 else 0
 
     by_model = defaultdict(float)
     by_cwd = defaultdict(float)

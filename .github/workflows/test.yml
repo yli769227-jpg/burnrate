@@ -1,0 +1,29 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate pricing.json
+        run: python -m json.tool pricing.json > /dev/null
+
+      - name: Lint install.sh
+        run: |
+          bash -n install.sh
+          shellcheck install.sh
+
+      - name: Run tests
+        run: |
+          pip install pytest
+          python -m pytest tests/ -v

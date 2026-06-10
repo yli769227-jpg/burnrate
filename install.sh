@@ -50,11 +50,15 @@ remove_path_block() {
   [ -f "$rc" ] || return 0
   if grep -qF "$RC_MARKER_START" "$rc"; then
     info "剥离 $rc 的 PATH 标记块"
-    [ "$DRY_RUN" = 0 ] && awk -v s="$RC_MARKER_START" -v e="$RC_MARKER_END" '
-      index($0,s) { skip=1; next }
-      skip && index($0,e) { skip=0; next }
-      !skip { print }
-    ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
+    # 注意: 不要写成 `[ "$DRY_RUN" = 0 ] && cmd` —— dry-run 下该模式让函数返回 1,
+    # 配合 set -e 会使脚本提前退出。
+    if [ "$DRY_RUN" = 0 ]; then
+      awk -v s="$RC_MARKER_START" -v e="$RC_MARKER_END" '
+        index($0,s) { skip=1; next }
+        skip && index($0,e) { skip=0; next }
+        !skip { print }
+      ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
+    fi
   fi
 }
 
@@ -63,7 +67,7 @@ if [ "$DO_UNINSTALL" = 1 ]; then
   for f in burnrate pricing.json; do
     if [ -f "$BIN_DIR/$f" ]; then
       info "删除 $BIN_DIR/$f"
-      [ "$DRY_RUN" = 0 ] && rm -f "$BIN_DIR/$f"
+      if [ "$DRY_RUN" = 0 ]; then rm -f "$BIN_DIR/$f"; fi
     fi
   done
   remove_path_block "$HOME/.zshrc"
@@ -104,9 +108,9 @@ else
   SRC_ROOT="$TMP_DIR"
 fi
 
-[ "$DRY_RUN" = 1 ] && warn "DRY RUN 模式 —— 不会写文件"
+if [ "$DRY_RUN" = 1 ]; then warn "DRY RUN 模式 —— 不会写文件"; fi
 info "目标目录: $BIN_DIR"
-[ "$DRY_RUN" = 0 ] && mkdir -p "$BIN_DIR"
+if [ "$DRY_RUN" = 0 ]; then mkdir -p "$BIN_DIR"; fi
 
 for f in burnrate pricing.json; do
   src="$SRC_ROOT/$f"
@@ -120,7 +124,7 @@ for f in burnrate pricing.json; do
     info "安装 $f"
     if [ "$DRY_RUN" = 0 ]; then
       cp "$src" "$dst"
-      [ "$f" = "burnrate" ] && chmod +x "$dst"
+      if [ "$f" = "burnrate" ]; then chmod +x "$dst"; fi
     fi
   fi
 done

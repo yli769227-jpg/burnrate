@@ -6,6 +6,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/yli769227-jpg/burnrate/actions/workflows/test.yml"><img src="https://github.com/yli769227-jpg/burnrate/actions/workflows/test.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT"></a>
   <img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+">
   <a href="#install"><img src="https://img.shields.io/badge/install-curl_%7C_bash-green.svg" alt="curl | bash"></a>
@@ -140,6 +141,14 @@ A: V1 reads Claude Code transcripts only. Codex / Cursor have similar JSONL with
 
 **Q: Does this match my actual Anthropic invoice?**
 A: Not exactly — we read local transcript `usage` fields; Anthropic's backend may have small reconciliation differences (<1% typical).
+
+**Q: Do `burnrate` (today) "7-day avg" and `burnrate week` use the same window?**
+A: No, by design:
+- `burnrate` (today) **"7-day avg"** = average over the **past 7 complete calendar days** (today excluded) — "today vs the average of 7 full days". Today isn't over yet; mixing it in would skew the average.
+- `burnrate week` = **today + the past 6 complete calendar days** (7 calendar days total; the last bar is today, marked `← today`). Its "daily avg" is computed over these 7 days.
+
+**Q: I use `--resume` / session branching — will calls be double-counted?**
+A: No. Claude Code copies historical messages into the new session file on resume; burnrate dedupes by `message.id + requestId`, so each API call is counted once.
 
 **Q: How is cache hit rate defined?**
 A: `cache_read_input_tokens / (input + cache_create + cache_read)`. In short: **fraction of total input that was cached**.
