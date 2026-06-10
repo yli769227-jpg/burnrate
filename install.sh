@@ -31,13 +31,32 @@ warn() { printf '%s[!]%s %s\n' "$C_YEL" "$C_RST" "$*"; }
 err()  { printf '%s[x]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
 dim()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_RST"; }
 
+print_help() {
+  # 内嵌 heredoc,而非 sed 读 "$0" —— curl|bash 方式下 $0 不是可读脚本文件,
+  # sed 会失败,导致 README 主推的 `curl ... | bash -s -- --help` 不工作。
+  cat <<'HELP'
+burnrate installer
+
+把 `burnrate` + `pricing.json` 装进 ~/.local/bin(或 $BURNRATE_BIN_DIR),
+并确保该目录在 PATH 上(只向 ~/.zshrc / ~/.bashrc 注入一次)。
+
+用法:
+  curl -fsSL https://raw.githubusercontent.com/yli769227-jpg/burnrate/main/install.sh | bash
+  curl -fsSL ... | bash -s -- --force        # 覆盖已存在
+  curl -fsSL ... | bash -s -- --dry-run      # 只打印
+  curl -fsSL ... | bash -s -- --uninstall    # 卸载
+
+也可本地直跑: bash install.sh [--force|--dry-run|--uninstall]
+HELP
+}
+
 FORCE=0; DRY_RUN=0; DO_UNINSTALL=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --uninstall) DO_UNINSTALL=1 ;;
-    --help|-h) sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h) print_help; exit 0 ;;
     *) err "未知参数: $arg (用 --help)"; exit 2 ;;
   esac
 done

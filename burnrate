@@ -105,7 +105,6 @@ def cost_of(usage: dict, price: dict) -> float:
 
 # ---------- 转录解析 ----------
 def iter_events(projects_dir: Path, since: datetime | None = None,
-                until: datetime | None = None,
                 file_filter: Path | None = None) -> Iterator[dict]:
     """Walk *.jsonl. Yield {timestamp, model, usage, session, cwd, file}."""
     files: Iterable[Path]
@@ -126,10 +125,13 @@ def iter_events(projects_dir: Path, since: datetime | None = None,
                     continue
             except OSError:
                 continue
+        # 损坏行计数器:含 usage 字段但 JSON 解析失败的行 = 被丢弃的计费数据,
+        # 会导致成本低估。逐行不刷屏,扫完该文件后汇总一次 warning。
+        bad_lines = [0]
         try:
             with jl.open("r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    for ev in _parse_line(line, jl, since, until):
+                    for ev in _parse_line(line, jl, since, bad_lines):
                         mid, rid = ev["message_id"], ev["request_id"]
                         if mid and rid:
                             key = f"{mid}:{rid}"
@@ -138,17 +140,25 @@ def iter_events(projects_dir: Path, since: datetime | None = None,
                             seen.add(key)
                         # 缺 id 的行无法判重,照常计
                         yield ev
-        except OSError:
+        except OSError as e:
+            # 文件级读取失败(并发删除/权限),整文件的成本被漏算,必须提示
+            print(f"{C_YEL}[!]{C_RST} 跳过无法读取的转录文件 {jl}: {e}", file=sys.stderr)
             continue
+        if bad_lines[0]:
+            print(f"{C_YEL}[!]{C_RST} {jl} 中 {bad_lines[0]} 行含 usage 但 JSON 解析失败,"
+                  f"已跳过(成本可能略低估)", file=sys.stderr)
 
 
-def _parse_line(line: str, file: Path, since, until):
+def _parse_line(line: str, file: Path, since, bad_lines=None):
     # Fast-path: most lines lack usage; skip without parsing
     if '"input_tokens"' not in line:
         return
     try:
         d = json.loads(line)
     except json.JSONDecodeError:
+        # 含 usage 字段却解析失败 = 丢了计费数据,记一笔(由调用方汇总提示)
+        if bad_lines is not None:
+            bad_lines[0] += 1
         return
     msg = d.get("message") or {}
     if msg.get("role") != "assistant":
@@ -164,8 +174,6 @@ def _parse_line(line: str, file: Path, since, until):
     except ValueError:
         return
     if since and t < since:
-        return
-    if until and t > until:
         return
     yield {
         "timestamp": t,
@@ -379,7 +387,14 @@ def find_latest_session_file() -> Path | None:
     if recent:
         return max(recent, key=lambda x: x[0])[1]
     # fallback: latest overall
-    all_files = [(jl.stat().st_mtime, jl) for jl in PROJECTS_DIR.glob("**/*.jsonl") if jl.exists()]
+    # 不能写成 `if jl.exists()` 再 stat —— exists() 与 stat() 之间文件可能被
+    # 并发删除(TOCTOU),stat() 会抛 OSError 直接崩。逐个 stat 并跳过消失的文件。
+    all_files = []
+    for jl in PROJECTS_DIR.glob("**/*.jsonl"):
+        try:
+            all_files.append((jl.stat().st_mtime, jl))
+        except OSError:
+            continue
     if not all_files:
         return None
     return max(all_files, key=lambda x: x[0])[1]
@@ -413,7 +428,7 @@ def cmd_live(args, pricing):
                 if not line:
                     pos = f.tell()
                     break
-                for ev in _parse_line(line, target, None, None):
+                for ev in _parse_line(line, target, None):
                     p = price_for(ev["model"], pricing)
                     c = cost_of(ev["usage"], p)
                     session_cost += c
@@ -442,7 +457,7 @@ def cmd_live(args, pricing):
                 if not line:
                     time.sleep(0.5)
                     continue
-                for ev in _parse_line(line, target, None, None):
+                for ev in _parse_line(line, target, None):
                     p = price_for(ev["model"], pricing)
                     c = cost_of(ev["usage"], p)
                     session_cost += c
